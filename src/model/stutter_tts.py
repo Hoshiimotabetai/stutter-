@@ -62,34 +62,29 @@ class StutterTTS(nn.Module):
                      src_seq: torch.Tensor,
                      tgt_seq: Optional[torch.Tensor] = None,
                      src_pad_idx: int = 0) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Create masks for encoder and decoder
-        Args:
-            src_seq: source sequence (phoneme IDs) [batch_size, src_len]
-            tgt_seq: target sequence (mel spectrogram) [batch_size, n_mels, tgt_len]
-            src_pad_idx: padding index for source sequence
-        """
-        # Source mask for encoder [batch_size, 1, 1, src_len]
+        """Create masks for encoder and decoder"""
+        # Source padding mask [batch_size, 1, 1, src_len]
         src_mask = (src_seq != src_pad_idx).unsqueeze(1).unsqueeze(2).to(torch.float32)
         
         # Target mask for decoder (if in training)
         if tgt_seq is not None:
-            tgt_len = tgt_seq.size(2)
+            tgt_len = tgt_seq.size(2)  # [batch_size, n_mels, time]
             
-            # Create padding mask [batch_size, 1, tgt_len, tgt_len]
+            # Create padding mask [batch_size, 1, time, time]
             tgt_pad_mask = torch.ones(
                 (tgt_seq.size(0), 1, tgt_len, tgt_len),
                 device=tgt_seq.device,
                 dtype=torch.float32
             )
             
-            # Create subsequent mask [tgt_len, tgt_len]
+            # Create causal mask [1, time, time]
             subsequent_mask = torch.triu(
-                torch.ones((tgt_len, tgt_len), device=tgt_seq.device),
+                torch.ones((1, tgt_len, tgt_len), device=tgt_seq.device),
                 diagonal=1
             )
             
             # Combine masks
-            tgt_mask = tgt_pad_mask * (1.0 - subsequent_mask.float())
+            tgt_mask = tgt_pad_mask * (1.0 - subsequent_mask)
         else:
             tgt_mask = None
             

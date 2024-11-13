@@ -40,28 +40,29 @@ class ScaledDotProductAttention(nn.Module):
         return output
 
 class MultiHeadAttention(nn.Module):
-    """Multi-Head Attention"""
+    """Multi-Head Attention with proper tensor shapes"""
     def __init__(self, n_head: int, d_model: int, dropout: float = 0.1):
         super().__init__()
+        
+        # Ensure d_model is divisible by n_head
+        assert d_model % n_head == 0, "d_model must be divisible by n_head"
         
         self.n_head = n_head
         self.d_k = d_model // n_head
         self.d_model = d_model
         
-        # Linear layers for Q, K, V
+        # Linear layers
         self.w_q = nn.Linear(d_model, d_model)
         self.w_k = nn.Linear(d_model, d_model)
         self.w_v = nn.Linear(d_model, d_model)
+        self.w_o = nn.Linear(d_model, d_model)
         
-        # Output linear layer
-        self.fc = nn.Linear(d_model, d_model)
-        
-        # Attention module
-        self.attention = ScaledDotProductAttention(temperature=math.sqrt(self.d_k))
-        
-        # Dropout and layer norm
+        # Dropout and normalization
         self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+        # Save attention weights for visualization
+        self.attention_weights = None
 
     def forward(self,
                 q: torch.Tensor,
@@ -70,39 +71,59 @@ class MultiHeadAttention(nn.Module):
                 mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
-            q: Query tensor [batch, time1, dim]
-            k: Key tensor [batch, time2, dim]
-            v: Value tensor [batch, time2, dim]
-            mask: Mask tensor [batch, time1, time2]
+            q: Query tensor [batch_size, seq_len_q, d_model]
+            k: Key tensor [batch_size, seq_len_k, d_model]
+            v: Value tensor [batch_size, seq_len_v, d_model]
+            mask: Optional mask tensor [batch_size, 1, seq_len_q, seq_len_k]
         Returns:
-            output: Attention output [batch, time1, dim]
-            attn: Attention weights (optional, for visualization)
+            output: Attention output [batch_size, seq_len_q, d_model]
+            attention: Attention weights (optional, for visualization)
         """
         batch_size = q.size(0)
+        seq_len_q, seq_len_k, seq_len_v = q.size(1), k.size(1), v.size(1)
+        
+        # Store residual
         residual = q
         
-        # Linear projection and reshape
-        q = self.w_q(q).view(batch_size, -1, self.n_head, self.d_k).transpose(1, 2)
-        k = self.w_k(k).view(batch_size, -1, self.n_head, self.d_k).transpose(1, 2)
-        v = self.w_v(v).view(batch_size, -1, self.n_head, self.d_k).transpose(1, 2)
+        # Linear projections and split heads
+        # [batch_size, seq_len, d_model] -> [batch_size, seq_len, n_head, d_k] -> [batch_size, n_head, seq_len, d_k]
+        q = self.w_q(q).view(batch_size, seq_len_q, self.n_head, self.d_k).transpose(1, 2)
+        k = self.w_k(k).view(batch_size, seq_len_k, self.n_head, self.d_k).transpose(1, 2)
+        v = self.w_v(v).view(batch_size, seq_len_v, self.n_head, self.d_k).transpose(1, 2)
         
+        # Calculate attention scores
+        # [batch_size, n_head, seq_len_q, d_k] @ [batch_size, n_head, d_k, seq_len_k]
+        # -> [batch_size, n_head, seq_len_q, seq_len_k]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        
+        # Apply mask if provided
         if mask is not None:
-            mask = mask.unsqueeze(1)  # [batch, 1, time1, time2]
+            # Expand mask for multiple heads: [batch_size, 1, 1, seq_len] -> [batch_size, n_head, seq_len_q, seq_len_k]
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            scores = scores.masked_fill(mask == 0, -1e9)
         
         # Apply attention
-        output = self.attention(q, k, v, mask=mask)
+        attn = self.dropout(F.softmax(scores, dim=-1))
+        self.attention_weights = attn.detach()
         
-        # Reshape and concat heads
-        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        # Apply attention to values
+        # [batch_size, n_head, seq_len_q, seq_len_k] @ [batch_size, n_head, seq_len_v, d_k]
+        # -> [batch_size, n_head, seq_len_q, d_k]
+        context = torch.matmul(attn, v)
+        
+        # Concatenate heads
+        # [batch_size, n_head, seq_len_q, d_k] -> [batch_size, seq_len_q, n_head, d_k]
+        # -> [batch_size, seq_len_q, d_model]
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len_q, self.d_model)
         
         # Final linear projection
-        output = self.fc(output)
-        output = self.dropout(output)
+        output = self.dropout(self.w_o(context))
         
         # Add residual and normalize
         output = self.layer_norm(output + residual)
         
-        return output, self.attention.attention_weights
+        return output, self.attention_weights
 
 class LocationSensitiveAttention(nn.Module):
     """Location-Sensitive Attention"""
