@@ -1,45 +1,29 @@
-import os
-import sys
-
-# プロジェクトのルートディレクトリをPythonパスに追加
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
-
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import argparse
 import logging
 from pathlib import Path
 from tqdm import tqdm
-from typing import Dict, Optional, Tuple
+import yaml
 import os
-import random
-import numpy as np
+from typing import Dict, Optional, Tuple
 
-from model import (
-    StutterTTS,
-    StutterTTSLoss,
-    create_model,
-    create_optimizer,
-    load_checkpoint,
-    save_checkpoint
-)
 from data import create_dataloaders
+from model import StutterTTS, StutterTTSLoss, create_model
 from utils import (
     set_seed,
     load_config,
     setup_logging,
     LearningRateScheduler,
     AverageMeter,
-    plot_mel_spectrogram,
+    save_figure,
+    plot_spectrogram,
     plot_attention,
-    save_training_state,
-    load_training_state,
-    get_gradient_norm,
-    calculate_model_size,
-    create_experiment_directory
+    create_experiment_directory,
+    calculate_gradient_norm
 )
 
 logger = logging.getLogger(__name__)
@@ -48,267 +32,241 @@ class Trainer:
     def __init__(self, config: Dict, experiment_dir: Optional[str] = None):
         self.config = config
         
-        # デバイスの設定
-        self.device = torch.device(config["training"]["device"])
-        
-        # 実験ディレクトリの設定
+        # Create experiment directory
         if experiment_dir is None:
-            dirs = create_experiment_directory(
-                config["training"]["experiment_dir"]
-            )
-        self.experiment_dir = dirs
+            experiment_dir = create_experiment_directory(config["training"]["experiment_dir"])
+        self.experiment_dir = experiment_dir
         
-        # ロギングの設定
+        # Setup logging
         setup_logging(self.experiment_dir["logs"])
         self.writer = SummaryWriter(self.experiment_dir["logs"])
         
-        # モデルの作成
+        # Setup device
+        self.device = torch.device(config["training"]["device"])
+        
+        # Create model
         self.model = create_model(config).to(self.device)
-        model_size = calculate_model_size(self.model)
-        logger.info(f"Model size: {model_size}")
+        logger.info(f"Model created with {sum(p.numel() for p in self.model.parameters()):,} parameters")
         
-        # 損失関数
-        self.criterion = StutterTTSLoss()
+        # Create loss function
+        self.criterion = StutterTTSLoss(config)
         
-        # 最適化器
-        self.optimizer = create_optimizer(self.model, config)
+        # Create optimizer
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=float(config["training"]["learning_rate"]),
+            betas=(float(config["training"]["beta1"]), float(config["training"]["beta2"])),
+            eps=float(config["training"]["epsilon"]),
+            weight_decay=float(config["training"].get("weight_decay", 0))
+        )
         
-        # スケジューラ
+        # Create learning rate scheduler
         self.scheduler = LearningRateScheduler(
             self.optimizer,
             config["model"]["d_model"],
             config["training"]["warmup_steps"]
         )
         
-        # データローダー
+        # Create data loaders
         self.train_loader, self.valid_loader, self.test_loader = create_dataloaders(config)
         
-        # トレーニング状態
+        # Initialize training state
         self.epoch = 0
-        self.global_step = 0
+        self.step = 0
         self.best_loss = float('inf')
         
-    def load_checkpoint(self, checkpoint_path: Optional[str] = None):
-        """チェックポイントの読み込み"""
-        if checkpoint_path is None:
-            checkpoint_path = os.path.join(
-                self.experiment_dir["checkpoints"],
-                "latest.pt"
-            )
+        # Gradient clipping
+        self.grad_clip = config["training"]["grad_clip_thresh"]
         
-        if os.path.exists(checkpoint_path):
-            self.epoch, self.global_step = load_checkpoint(
-                self.model,
-                self.optimizer,
-                checkpoint_path
-            )
-            
-            # トレーニング状態の読み込み
-            state_path = Path(checkpoint_path).with_suffix('.json')
-            if state_path.exists():
-                state = load_training_state(str(state_path))
-                self.best_loss = state.get('best_loss', float('inf'))
-                logger.info(f"Resumed from epoch {self.epoch} (global step: {self.global_step})")
+        # Training config
+        self.log_interval = config["training"]["log_interval"]
+        self.eval_interval = config["training"]["eval_interval"]
+        self.save_interval = config["training"]["save_interval"]
+        self.max_epochs = config["training"]["epochs"]
     
     def save_checkpoint(self, name: str = "latest"):
-        """チェックポイントの保存"""
-        save_checkpoint(
-            self.model,
-            self.optimizer,
-            self.epoch,
-            self.global_step,
-            self.experiment_dir["checkpoints"],
-            name
-        )
-        
-        # トレーニング状態の保存
-        state_path = os.path.join(
-            self.experiment_dir["checkpoints"],
-            f"{name}_epoch{self.epoch}.json"
-        )
-        save_training_state(
-            {
-                'epoch': self.epoch,
-                'global_step': self.global_step,
-                'best_loss': self.best_loss
-            },
-            state_path
-        )
+        """Save model checkpoint"""
+        checkpoint_path = Path(self.experiment_dir["checkpoints"]) / f"{name}.pt"
+        torch.save({
+            'epoch': self.epoch,
+            'step': self.step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'loss': self.best_loss,
+        }, checkpoint_path)
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint"""
+        checkpoint = torch.load(checkpoint_path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.epoch = checkpoint.get('epoch', 0)
+        self.step = checkpoint.get('step', 0)
+        self.best_loss = checkpoint.get('loss', float('inf'))
+        logger.info(f"Loaded checkpoint from {checkpoint_path}")
     
     def train_epoch(self) -> float:
-        """1エポックの学習"""
+        """Train for one epoch"""
         self.model.train()
         epoch_loss = AverageMeter()
         
-        with tqdm(total=len(self.train_loader), desc=f'Epoch {self.epoch + 1}') as pbar:
+        with tqdm(total=len(self.train_loader), desc=f'Epoch {self.epoch+1}') as pbar:
             for batch in self.train_loader:
-                # データをデバイスに移動
+                # Move data to device
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                         for k, v in batch.items()}
                 
-                # フォワードパス
+                # Forward pass
                 mel_output, mel_postnet, stop_tokens = self.model(
                     phoneme_ids=batch["phoneme_ids"],
                     mel_target=batch["mel_spectrogram"],
                     reference_mel=batch.get("reference_mel")
                 )
                 
-                # 損失の計算
+                # Calculate loss
                 loss, loss_dict = self.criterion(
-                    mel_output,
-                    mel_postnet,
-                    stop_tokens,
-                    batch["mel_spectrogram"],
-                    batch["mel_masks"]
+                    mel_output, mel_postnet, stop_tokens,
+                    batch["mel_spectrogram"], batch["mel_masks"]
                 )
                 
-                # バックワードパス
+                # Backward pass
                 self.optimizer.zero_grad()
                 loss.backward()
                 
-                # 勾配クリッピング
+                # Gradient clipping
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config["training"]["grad_clip_thresh"]
+                    self.model.parameters(), self.grad_clip
                 )
                 
+                # Optimizer step
                 self.optimizer.step()
                 self.scheduler.step()
                 
-                # メトリクスの更新
+                # Update metrics
                 epoch_loss.update(loss.item())
-                self.global_step += 1
+                self.step += 1
                 
-                # ログの記録
-                if self.global_step % self.config["training"]["log_interval"] == 0:
-                    self._log_training_step(loss_dict, batch, grad_norm)
+                # Logging
+                if self.step % self.log_interval == 0:
+                    self._log_training_step(loss_dict, grad_norm, batch)
                 
-                # プログレスバーの更新
-                pbar.set_postfix(loss=f'{epoch_loss.avg:.4f}', lr=f'{self.scheduler._get_lr():.6f}')
+                # Validation
+                if self.step % self.eval_interval == 0:
+                    val_loss = self.validate()
+                    self.model.train()
+                
+                # Save checkpoint
+                if self.step % self.save_interval == 0:
+                    self.save_checkpoint()
+                
+                # Update progress bar
+                pbar.set_postfix(loss=f'{epoch_loss.avg:.4f}',
+                               lr=f'{self.scheduler._get_lr():.6f}')
                 pbar.update(1)
         
         return epoch_loss.avg
     
     @torch.no_grad()
     def validate(self) -> float:
-        """検証"""
+        """Run validation"""
         self.model.eval()
         val_loss = AverageMeter()
         
         for batch in tqdm(self.valid_loader, desc='Validation'):
-            # データをデバイスに移動
+            # Move data to device
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()}
             
-            # フォワードパス
+            # Forward pass
             mel_output, mel_postnet, stop_tokens = self.model(
                 phoneme_ids=batch["phoneme_ids"],
                 mel_target=batch["mel_spectrogram"],
                 reference_mel=batch.get("reference_mel")
             )
             
-            # 損失の計算
+            # Calculate loss
             loss, loss_dict = self.criterion(
-                mel_output,
-                mel_postnet,
-                stop_tokens,
-                batch["mel_spectrogram"],
-                batch["mel_masks"]
+                mel_output, mel_postnet, stop_tokens,
+                batch["mel_spectrogram"], batch["mel_masks"]
             )
             
             val_loss.update(loss.item())
         
-        # バリデーションの結果をログ
+        # Log validation results
         self._log_validation(val_loss.avg, batch)
         
         return val_loss.avg
     
-    def _log_training_step(self, loss_dict: Dict[str, float], batch: Dict, grad_norm: float):
-        """トレーニングステップのログ記録"""
-        # 損失のログ
+    def _log_training_step(self, loss_dict: Dict, grad_norm: float, batch: Dict):
+        """Log training step information"""
+        # Log losses
         for name, value in loss_dict.items():
-            self.writer.add_scalar(f'train/{name}', value, self.global_step)
+            self.writer.add_scalar(f'train/{name}', value, self.step)
         
-        # 勾配ノルムのログ
-        self.writer.add_scalar('train/gradient_norm', grad_norm, self.global_step)
+        # Log gradient norm
+        self.writer.add_scalar('train/gradient_norm', grad_norm, self.step)
         
-        # 学習率のログ
-        self.writer.add_scalar('train/learning_rate', self.scheduler._get_lr(), self.global_step)
+        # Log learning rate
+        self.writer.add_scalar('train/learning_rate',
+                             self.scheduler._get_lr(), self.step)
         
-        # サンプルの可視化（定期的に）
-        if self.global_step % self.config["training"]["sample_interval"] == 0:
-            self._log_samples(batch, prefix='train')
+        # Log spectrograms
+        if self.step % (self.log_interval * 10) == 0:
+            idx = 0  # First item in batch
+            fig = plot_spectrogram(batch["mel_spectrogram"][idx],
+                                 title="Ground Truth Mel-spectrogram")
+            self.writer.add_figure('train/mel_target', fig, self.step)
+            
+            # Get attention weights
+            attentions = self.model.get_attention_weights()
+            for name, weights in attentions.items():
+                if weights:  # if not empty
+                    fig = plot_attention(weights[-1][0],
+                                      title=f"{name} (Last Layer)")
+                    self.writer.add_figure(f'train/{name}', fig, self.step)
     
     def _log_validation(self, val_loss: float, batch: Dict):
-        """バリデーション結果のログ記録"""
-        self.writer.add_scalar('validation/loss', val_loss, self.global_step)
+        """Log validation results"""
+        self.writer.add_scalar('validation/loss', val_loss, self.step)
         
-        # サンプルの可視化
-        self._log_samples(batch, prefix='validation')
+        # Log sample spectrograms
+        idx = 0  # First item in batch
+        fig = plot_spectrogram(batch["mel_spectrogram"][idx],
+                             title="Validation Ground Truth")
+        self.writer.add_figure('validation/mel_target', fig, self.step)
         
-        # 最良モデルの保存
+        # Save model if best loss
         if val_loss < self.best_loss:
             self.best_loss = val_loss
             self.save_checkpoint('best')
             logger.info(f'New best model saved (loss: {val_loss:.4f})')
     
-    def _log_samples(self, batch: Dict, prefix: str = 'train'):
-        """生成サンプルの可視化"""
-        idx = random.randint(0, len(batch["mel_spectrogram"]) - 1)
-        
-        # 真のメルスペクトログラム
-        fig_true = plot_mel_spectrogram(
-            batch["mel_spectrogram"][idx],
-            title='Ground Truth Mel-spectrogram'
-        )
-        self.writer.add_figure(f'{prefix}/true_mel', fig_true, self.global_step)
-        
-        # 生成されたメルスペクトログラム
-        with torch.no_grad():
-            mel_output, mel_postnet, _ = self.model(
-                phoneme_ids=batch["phoneme_ids"][idx:idx+1],
-                reference_mel=batch.get("reference_mel")[idx:idx+1] if batch.get("reference_mel") is not None else None
-            )
-        
-        fig_pred = plot_mel_spectrogram(
-            mel_postnet[0],
-            title='Generated Mel-spectrogram'
-        )
-        self.writer.add_figure(f'{prefix}/predicted_mel', fig_pred, self.global_step)
-        
-        # サンプルの保存
-        if self.global_step % self.config["training"]["save_sample_interval"] == 0:
-            sample_dir = Path(self.experiment_dir["samples"]) / f'step_{self.global_step}'
-            sample_dir.mkdir(parents=True, exist_ok=True)
-            
-            fig_true.savefig(sample_dir / f'{prefix}_true_mel.png')
-            fig_pred.savefig(sample_dir / f'{prefix}_predicted_mel.png')
-    
     def train(self, resume_checkpoint: Optional[str] = None):
-        """トレーニングのメインループ"""
-        # チェックポイントからの復帰
+        """Main training loop"""
+        # Load checkpoint if specified
         if resume_checkpoint:
             self.load_checkpoint(resume_checkpoint)
         
         try:
-            # トレーニングループ
-            for epoch in range(self.epoch, self.config["training"]["epochs"]):
+            # Training loop
+            for epoch in range(self.epoch, self.max_epochs):
                 self.epoch = epoch
                 
-                # トレーニング
+                # Train epoch
                 train_loss = self.train_epoch()
                 logger.info(f'Epoch {epoch + 1}: train_loss = {train_loss:.4f}')
                 
-                # 検証
+                # Validation
                 val_loss = self.validate()
                 logger.info(f'Epoch {epoch + 1}: val_loss = {val_loss:.4f}')
                 
-                # チェックポイントの保存
-                self.save_checkpoint('latest')
+                # Save checkpoint
+                self.save_checkpoint()
                 
-                # 定期的なチェックポイント
-                if (epoch + 1) % self.config["training"]["checkpoint_interval"] == 0:
-                    self.save_checkpoint(f'epoch_{epoch + 1}')
+                # Save epoch checkpoint
+                if (epoch + 1) % 10 == 0:
+                    self.save_checkpoint(f'epoch_{epoch+1}')
         
         except KeyboardInterrupt:
             logger.info('Training interrupted by user')
@@ -332,13 +290,13 @@ def main():
                        help='Random seed')
     args = parser.parse_args()
     
-    # シードの設定
+    # Set random seed
     set_seed(args.seed)
     
-    # 設定の読み込み
+    # Load configuration
     config = load_config(args.config)
     
-    # トレーナーの作成と学習の実行
+    # Create trainer and start training
     trainer = Trainer(config)
     trainer.train(resume_checkpoint=args.resume)
 

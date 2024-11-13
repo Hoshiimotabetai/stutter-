@@ -1,33 +1,22 @@
 # Data Configuration
 data:
-  librispeech_path: "data/LibriSpeech/wav"
-#  uclass_path: "data/UCLASS"
+  librispeech_path: "data/LibriSpeech/wav" #  uclass_path: "data/UCLASS"
   sample_rate: 16000
   n_mels: 80
   n_fft: 1024
-  hop_length: 200  # 12.5ms
-  win_length: 800  # 50ms
+  hop_length: 200
+  win_length: 800
+  normalize_audio: true
+  trim_silence: true
+  min_silence_threshold: 20
   mel_fmin: 0
   mel_fmax: 8000
-  fluent_ratio: 1.0
-  max_duration: null  # null for no limit
-
-  # シーケンス長の制限
+  power: 1.0
   max_mel_length: 800
-  min_mel_length: 20
   max_text_length: 150
+  min_mel_length: 20
+  max_duration: 10.0
 
-  # データ処理
-  max_duration: 12.0  # 最大音声長（秒）
-  min_duration: 1.0   # 最小音声長（秒）
-  trim_silence: true
-  top_db: 60
-  
-  # データ分割比率
-  fluent_ratio: 1.0  # 現段階ではLibriSpeechのみ使用
-
-
-# Model Configuration
 model:
   d_model: 512
   n_heads: 8
@@ -35,135 +24,48 @@ model:
   n_decoder_layers: 6
   d_ff: 2048
   dropout: 0.1
-#  n_speakers: 100  # Adjusted based on actual dataset
-  n_phonemes: 100  # Adjusted based on phoneme set size
-
- # Prenetパラメータ
-  prenet_dropout: 0.6
+  n_phonemes: 100
+  prenet_dropout: 0.5
   prenet_hidden_dim: 256
-  
-  # Postnetパラメータ
   postnet_channels: 512
   postnet_kernel_size: 5
   postnet_dropout: 0.1
-  
-  # リファレンスエンコーダー
+  postnet_layers: 5
   ref_enc_filters: [32, 32, 64, 64, 128, 128]
   ref_enc_kernel_size: 3
   ref_enc_stride: 2
   ref_enc_dropout: 0.1
 
-# Training Configuration
 training:
+  batch_size: 8
   epochs: 500
-  batch_size: 4
+  learning_rate: 0.001
+  beta1: 0.9
+  beta2: 0.98
+  epsilon: 0.000000001
   grad_clip_thresh: 1.0
-  seed: 42
-  device: "cuda"  # or "cpu"
+  warmup_steps: 4000
+  weight_decay: 0.0001
+  device: "cuda"
   num_workers: 4
-  
-  num_workers: 4
-  learning_rate: 0.0001
-  max_epochs: 100
-  checkpoint_dir: "checkpoints"
-  log_dir: "logs"
-  device: "cuda"  # or "cpu"
-  
-    # メモリ管理
   pin_memory: true
   prefetch_factor: 2
-  gradient_accumulation_steps: 8
-
-   # 勾配累積
-  gradient_accumulation_steps: 4  # 実効的なバッチサイズ = 8 * 4 = 32
-
-  # 最適化
-  optimizer:
-    name: "adam"
-    learning_rate: 0.0001
-    beta1: 0.9
-    beta2: 0.998
-    epsilon: 1e-9
-    weight_decay: 1.0e-6
-  
-  # 学習率スケジューリング
-  warmup_steps: 4000
-  
-  # チェックポイントと保存
-  checkpoint_interval: 5    # エポック単位
-  save_sample_interval: 1000  # ステップ単位
+  checkpoint_interval: 5000
   keep_last_checkpoints: 5
-  
-  # ロギングと可視化
-  log_interval: 100        # ステップ単位
-  sample_interval: 1000    # ステップ単位
-  
-  # 実験管理
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 10000
   experiment_dir: "experiments"
-  
-# Inference Configuration
-inference:
-  max_mel_length: 1000
-  gate_threshold: 0.5
-  noise_scale: 0.667
-  noise_scale_w: 0.8
-  length_scale: 1.0
-
-# Paths and Directories
-paths:
-  # 実験関連
-  log_dir: "logs"
   checkpoint_dir: "checkpoints"
+  log_dir: "logs"
   sample_dir: "samples"
-  
-  # モデル関連
-  pretrained_model: null  # 事前学習済みモデルのパス（オプション）
-  vocoder_path: null      # ボコーダーのパス（将来的な使用のため）
 
-# Validation Configuration
 validation:
-  batch_size: 16
-  interval: 1000  # ステップ単位
-  num_samples: 4  # 検証時に生成するサンプル数
+  batch_size: 8
+  num_samples: 4
+  max_generation_length: 1000
 
-# Loss Configuration
 loss:
-  # メルスペクトログラム損失の重み
   mel_loss_weight: 1.0
   postnet_mel_loss_weight: 1.0
-  
-  # 停止トークン予測の重み
   stop_token_loss_weight: 0.5
-  
-  # 正則化
-  l2_regularization_weight: 0.0001
-
-# Audio Processing
-audio:
-  # 前処理
-  normalize_audio: true
-  preemphasis: 0.97
-  
-  # スペクトログラム
-  power: 1.5
-  griffin_lim_iters: 60
-  
-  # 音量正規化
-  ref_level_db: 20
-  max_abs_value: 4.0
-  min_level_db: -100
-
-# Logging Configuration
-logging:
-  level: "INFO"
-  log_steps: true
-  log_grad_norm: true
-  log_weights_hist: false
-  log_memory_usage: true
-
-# Stutter Configuration
-stutter:
-  tokens:
-    repetition: "<s_rep>"
-    phonation: "<s_pho>"
-    block: "<s_blk>"

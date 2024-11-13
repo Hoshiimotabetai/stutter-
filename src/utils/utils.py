@@ -1,36 +1,29 @@
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from typing import Dict, Any, Optional, List
 import numpy as np
-import matplotlib.pyplot as plt
+import random
 import yaml
-from pathlib import Path
 import logging
+import matplotlib.pyplot as plt
+from pathlib import Path
 from datetime import datetime
-import json
-import os
-
-logger = logging.getLogger(__name__)
+from typing import Dict, Optional, Union, Any, List
 
 def set_seed(seed: int):
-    """再現性のためにシードを設定"""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    """Set random seed for reproducibility"""
+    random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """設定ファイルの読み込み"""
+def load_config(config_path: str) -> Dict:
+    """Load configuration from YAML file"""
     with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+        return yaml.safe_load(f)
 
-def setup_logging(log_dir: str, experiment_name: Optional[str] = None) -> str:
-    """ロギングの設定"""
-    if experiment_name is None:
-        experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    log_dir = Path(log_dir) / experiment_name
+def setup_logging(log_dir: str) -> None:
+    """Setup logging configuration"""
+    log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     
     logging.basicConfig(
@@ -41,18 +34,17 @@ def setup_logging(log_dir: str, experiment_name: Optional[str] = None) -> str:
             logging.StreamHandler()
         ]
     )
-    
-    return str(log_dir)
 
-def save_fig(fig: plt.Figure, path: str):
-    """図の保存"""
-    fig.savefig(path, dpi=300, bbox_inches='tight')
+def save_figure(fig: plt.Figure, path: str) -> None:
+    """Save matplotlib figure"""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, bbox_inches='tight', dpi=300)
     plt.close(fig)
 
-def plot_mel_spectrogram(mel_spec: torch.Tensor, title: str = '') -> plt.Figure:
-    """メルスペクトログラムのプロット"""
+def plot_spectrogram(spectrogram: torch.Tensor, title: str = '') -> plt.Figure:
+    """Plot mel spectrogram"""
     fig, ax = plt.subplots(figsize=(10, 4))
-    im = ax.imshow(mel_spec.detach().cpu().numpy(),
+    im = ax.imshow(spectrogram.detach().cpu().numpy(),
                    aspect='auto',
                    origin='lower',
                    interpolation='none')
@@ -61,7 +53,7 @@ def plot_mel_spectrogram(mel_spec: torch.Tensor, title: str = '') -> plt.Figure:
     return fig
 
 def plot_attention(attention: torch.Tensor, title: str = '') -> plt.Figure:
-    """アテンションマップのプロット"""
+    """Plot attention weights"""
     fig, ax = plt.subplots(figsize=(10, 10))
     im = ax.imshow(attention.detach().cpu().numpy(),
                    aspect='auto',
@@ -72,93 +64,80 @@ def plot_attention(attention: torch.Tensor, title: str = '') -> plt.Figure:
     return fig
 
 class LearningRateScheduler:
-    """Transformer用の学習率スケジューラ"""
-    def __init__(self, optimizer: torch.optim.Optimizer, d_model: int, warmup_steps: int):
+    """Learning rate scheduler with warmup"""
+    def __init__(self,
+                 optimizer: torch.optim.Optimizer,
+                 d_model: int,
+                 warmup_steps: int):
         self.optimizer = optimizer
         self.d_model = d_model
         self.warmup_steps = warmup_steps
         self.current_step = 0
-    
+
     def step(self):
-        """学習率の更新"""
+        """Update learning rate"""
         self.current_step += 1
         lr = self._get_lr()
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
-    
+
     def _get_lr(self) -> float:
-        """現在の学習率を計算"""
+        """Calculate learning rate with warmup"""
         step = self.current_step
-        return self.d_model ** (-0.5) * min(step ** (-0.5), step * self.warmup_steps ** (-1.5))
+        return self.d_model ** (-0.5) * min(step ** (-0.5),
+                                          step * self.warmup_steps ** (-1.5))
 
 class AverageMeter:
-    """値の平均を追跡"""
+    """Keep track of average values"""
     def __init__(self):
         self.reset()
-    
+
     def reset(self):
         self.val = 0
         self.avg = 0
         self.sum = 0
         self.count = 0
-    
+
     def update(self, val: float, n: int = 1):
         self.val = val
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
 
-def save_training_state(state: Dict[str, Any], path: str):
-    """トレーニング状態の保存"""
-    try:
-        with open(path, 'w') as f:
-            json.dump(state, f, indent=4)
-    except Exception as e:
-        logger.error(f"Error saving training state: {str(e)}")
+def save_training_state(state: Dict[str, Any], path: str) -> None:
+    """Save training state"""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, path)
 
 def load_training_state(path: str) -> Dict[str, Any]:
-    """トレーニング状態の読み込み"""
-    try:
-        with open(path, 'r') as f:
-            state = json.load(f)
-        return state
-    except Exception as e:
-        logger.error(f"Error loading training state: {str(e)}")
+    """Load training state"""
+    if not Path(path).exists():
         return {}
+    return torch.load(path)
 
-def get_gradient_norm(model: nn.Module) -> float:
-    """モデルの勾配ノルムを計算"""
+def calculate_gradient_norm(model: torch.nn.Module) -> float:
+    """Calculate gradient norm of model parameters"""
     total_norm = 0
     for p in model.parameters():
         if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
+            total_norm += p.grad.data.norm(2).item() ** 2
     return total_norm ** 0.5
 
-def calculate_model_size(model: nn.Module) -> Dict[str, int]:
-    """モデルのサイズを計算"""
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    return {
-        'total_parameters': total_params,
-        'trainable_parameters': trainable_params,
-        'non_trainable_parameters': total_params - trainable_params
-    }
-
-def create_experiment_directory(base_dir: str, experiment_name: Optional[str] = None) -> Dict[str, str]:
-    """実験ディレクトリの作成"""
+def create_experiment_directory(base_dir: str,
+                              experiment_name: Optional[str] = None) -> Dict[str, str]:
+    """Create experiment directory structure"""
     if experiment_name is None:
         experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     exp_dir = Path(base_dir) / experiment_name
     
-    # サブディレクトリの作成
+    # Create subdirectories
     dirs = {
+        'root': exp_dir,
         'checkpoints': exp_dir / 'checkpoints',
         'logs': exp_dir / 'logs',
         'samples': exp_dir / 'samples',
-        'visualizations': exp_dir / 'visualizations'
+        'eval': exp_dir / 'eval'
     }
     
     for dir_path in dirs.values():

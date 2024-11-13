@@ -10,21 +10,33 @@ class ScaledDotProductAttention(nn.Module):
         super().__init__()
         self.temperature = temperature
         self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, 
+        self.attention_weights = None  # デバッグ用
+
+    def forward(self,
                 q: torch.Tensor,
-                k: torch.Tensor, 
+                k: torch.Tensor,
                 v: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # (batch, head, time1, d_k) x (batch, head, d_k, time2) -> (batch, head, time1, time2)
+        """
+        Args:
+            q: Query tensor [batch, head, time1, dim]
+            k: Key tensor [batch, head, time2, dim]
+            v: Value tensor [batch, head, time2, dim]
+            mask: Mask tensor [batch, 1, time1, time2] or [batch, head, time1, time2]
+        """
+        # Calculate attention scores
         attn = torch.matmul(q, k.transpose(-2, -1)) / self.temperature
         
+        # Apply mask
         if mask is not None:
             attn = attn.masked_fill(mask == 0, -1e9)
         
+        # Apply softmax and dropout
         attn = self.dropout(F.softmax(attn, dim=-1))
-        output = torch.matmul(attn, v)  # (batch, head, time1, d_v)
+        self.attention_weights = attn.detach()  # Save for visualization
         
+        # Apply attention to values
+        output = torch.matmul(attn, v)
         return output
 
 class MultiHeadAttention(nn.Module):
@@ -34,174 +46,151 @@ class MultiHeadAttention(nn.Module):
         
         self.n_head = n_head
         self.d_k = d_model // n_head
-        self.d_v = d_model // n_head
         self.d_model = d_model
         
-        self.w_q = nn.Linear(d_model, d_model)#n_head * self.d_k, bias=False)
-        self.w_k = nn.Linear(d_model, d_model)#n_head * self.d_k, bias=False)
-        self.w_v = nn.Linear(d_model, d_model)#n_head * self.d_v, bias=False)
-
-        self.fc = nn.Linear(d_model,d_model)#n_head * self.d_v, d_model, bias=False)
+        # Linear layers for Q, K, V
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
         
-        #self.attention = ScaledDotProductAttention(temperature=self.d_k ** 0.5)
+        # Output linear layer
+        self.fc = nn.Linear(d_model, d_model)
+        
+        # Attention module
+        self.attention = ScaledDotProductAttention(temperature=math.sqrt(self.d_k))
+        
+        # Dropout and layer norm
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
-    
+
     def forward(self,
                 q: torch.Tensor,
                 k: torch.Tensor,
                 v: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        #d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
-        #batch_size, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
+                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            q: Query tensor [batch, time1, dim]
+            k: Key tensor [batch, time2, dim]
+            v: Value tensor [batch, time2, dim]
+            mask: Mask tensor [batch, time1, time2]
+        Returns:
+            output: Attention output [batch, time1, dim]
+            attn: Attention weights (optional, for visualization)
+        """
         batch_size = q.size(0)
-        
         residual = q
         
-        # Linear projections
+        # Linear projection and reshape
         q = self.w_q(q).view(batch_size, -1, self.n_head, self.d_k).transpose(1, 2)
         k = self.w_k(k).view(batch_size, -1, self.n_head, self.d_k).transpose(1, 2)
-        v = self.w_v(v).view(batch_size, -1, self.n_head, self.d_v).transpose(1, 2)
-
-        # Scale factor
-        scaling = float(self.d_k) ** -0.5
-        
-        # Calculate attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scaling
+        v = self.w_v(v).view(batch_size, -1, self.n_head, self.d_k).transpose(1, 2)
         
         if mask is not None:
-            mask = mask.unsqueeze(1)
-            scores = scores.masked_fill(mask == 0, -1e9)
-        
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-        
-        # Apply attention to values
-        context = torch.matmul(attn, v)
-        
-        # Reshape and concatenate heads
-        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        
-        # Final linear projection
-        output = self.dropout(self.fc(context))
-        
-        # Add residual and normalize
-        return self.layer_norm(output + residual)
-
-        """
-        q = self.w_q(q).view(batch_size, len_q, n_head, d_k)
-        k = self.w_k(k).view(batch_size, len_k, n_head, d_k)
-        v = self.w_v(v).view(batch_size, len_v, n_head, d_v)
-        
-        # Transpose for attention calculation
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        
-        if mask is not None:
-            mask = mask.unsqueeze(1)  # For head axis broadcasting
+            mask = mask.unsqueeze(1)  # [batch, 1, time1, time2]
         
         # Apply attention
         output = self.attention(q, k, v, mask=mask)
         
-        # Transpose and reshape
-        output = output.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
-        output = self.dropout(self.fc(output))
+        # Reshape and concat heads
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        
+        # Final linear projection
+        output = self.fc(output)
+        output = self.dropout(output)
+        
+        # Add residual and normalize
         output = self.layer_norm(output + residual)
         
-        return output
-        """
+        return output, self.attention.attention_weights
 
-class RelativePositionMultiHeadAttention(nn.Module):
-    """Relative Position-based Multi-Head Attention"""
-    def __init__(self, n_head: int, d_model: int, dropout: float = 0.1, max_relative_position: int = 100):
+class LocationSensitiveAttention(nn.Module):
+    """Location-Sensitive Attention"""
+    def __init__(self,
+                 attention_dim: int,
+                 attention_filters: int = 32,
+                 attention_kernel: int = 31,
+                 dropout: float = 0.1):
         super().__init__()
         
-        self.n_head = n_head
-        self.d_k = d_model // n_head
-        self.d_v = d_model // n_head
-        self.max_relative_position = max_relative_position
-        
-        self.w_q = nn.Linear(d_model, n_head * self.d_k, bias=False)
-        self.w_k = nn.Linear(d_model, n_head * self.d_k, bias=False)
-        self.w_v = nn.Linear(d_model, n_head * self.d_v, bias=False)
-        self.w_r = nn.Linear(d_model, n_head * self.d_k, bias=False)
-        self.fc = nn.Linear(n_head * self.d_v, d_model, bias=False)
-        
-        # Relative position embedding
-        self.rel_embeddings = nn.Parameter(
-            torch.Tensor(max_relative_position * 2 + 1, self.d_k)
+        self.location_conv = nn.Conv1d(
+            in_channels=2,  # Previous attention weights + cumulative weights
+            out_channels=attention_filters,
+            kernel_size=attention_kernel,
+            padding=(attention_kernel - 1) // 2,
+            bias=False
         )
-        nn.init.xavier_uniform_(self.rel_embeddings)
+        self.location_dense = nn.Linear(attention_filters, attention_dim, bias=False)
+        
+        self.query_layer = nn.Linear(attention_dim, attention_dim, bias=False)
+        self.memory_layer = nn.Linear(attention_dim, attention_dim, bias=False)
+        self.v = nn.Linear(attention_dim, 1, bias=False)
         
         self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
-    
-    def _relative_position_bucket(self, relative_position: torch.Tensor) -> torch.Tensor:
-        """Convert relative position to bucket index"""
-        relative_bucket = relative_position.clamp(
-            -self.max_relative_position,
-            self.max_relative_position
-        )
-        return relative_bucket + self.max_relative_position
-    
+        self.score_mask_value = -float("inf")
+
     def forward(self,
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        batch_size, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
-        
-        residual = q
-        
-        # Linear projections
-        q = self.w_q(q).view(batch_size, len_q, self.n_head, self.d_k)
-        k = self.w_k(k).view(batch_size, len_k, self.n_head, self.d_k)
-        v = self.w_v(v).view(batch_size, len_v, self.n_head, self.d_v)
-        
-        # Transpose for attention calculation
-        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
-        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
-        v = v.transpose(1, 2)  # (batch, head, time2, d_v)
-        
-        # Prepare relative position embeddings
-        position_ids = torch.arange(len_q, device=q.device)[:, None] - \
-                      torch.arange(len_k, device=k.device)[None, :]
-        relative_position_bucket = self._relative_position_bucket(position_ids)
-        relations_keys = self.rel_embeddings[relative_position_bucket]
+                query: torch.Tensor,
+                memory: torch.Tensor,
+                attention_weights_cat: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            query: Query tensor [batch, 1, attention_dim]
+            memory: Memory tensor [batch, max_time, attention_dim]
+            attention_weights_cat: Previous and cumulative attention weights [batch, 2, max_time]
+            mask: Memory mask [batch, max_time]
+        """
+        # Process location features
+        location_features = self.location_conv(attention_weights_cat)
+        location_features = location_features.transpose(1, 2)
+        location_features = self.location_dense(location_features)
         
         # Calculate attention scores
-        content_score = torch.matmul(q, k.transpose(-2, -1))
-        position_score = torch.matmul(q, relations_keys.transpose(-2, -1))
+        processed_query = self.query_layer(query)
+        processed_memory = self.memory_layer(memory)
         
-        attention_scores = (content_score + position_score) / math.sqrt(self.d_k)
+        alignment = processed_memory + processed_query + location_features
+        alignment = torch.tanh(alignment)
+        alignment = self.v(alignment).squeeze(-1)
         
+        # Apply mask
         if mask is not None:
-            attention_scores = attention_scores.masked_fill(mask == 0, -1e9)
+            alignment = alignment.masked_fill(mask == 0, self.score_mask_value)
         
-        attention_probs = F.softmax(attention_scores, dim=-1)
-        attention_probs = self.dropout(attention_probs)
+        # Apply softmax and dropout
+        attention_weights = F.softmax(alignment, dim=1)
+        attention_weights = self.dropout(attention_weights)
         
-        # Apply attention to values
-        output = torch.matmul(attention_probs, v)
+        # Apply attention
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory)
+        attention_context = attention_context.squeeze(1)
         
-        # Transpose and reshape
-        output = output.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
-        output = self.dropout(self.fc(output))
-        output = self.layer_norm(output + residual)
-        
-        return output
+        return attention_context, attention_weights
 
-# Attention関連のユーティリティ関数
+# Utility functions for creating masks
 def create_padding_mask(seq: torch.Tensor, pad_idx: int = 0) -> torch.Tensor:
-    """パディングマスクの作成"""
+    """Create padding mask"""
     return (seq != pad_idx).unsqueeze(1).unsqueeze(2)
 
-def create_look_ahead_mask(size: int) -> torch.Tensor:
-    """先読み防止用マスクの作成"""
-    mask = torch.triu(torch.ones(size, size), diagonal=1)
-    return torch.zeros_like(mask).masked_fill(mask == 1, float('-inf'))
+def create_subsequent_mask(seq_len: int) -> torch.Tensor:
+    """Create subsequent mask for autoregressive generation"""
+    subsequent_mask = torch.triu(
+        torch.ones((seq_len, seq_len)), diagonal=1
+    ).bool()
+    return subsequent_mask
 
-def create_combined_mask(seq: torch.Tensor, pad_idx: int = 0) -> torch.Tensor:
-    """パディングマスクと先読み防止マスクの組み合わせ"""
-    pad_mask = create_padding_mask(seq, pad_idx)
-    look_ahead_mask = create_look_ahead_mask(seq.size(1))
-    return pad_mask & look_ahead_mask
+def create_attention_mask(src_seq: torch.Tensor,
+                         tgt_seq: Optional[torch.Tensor] = None,
+                         pad_idx: int = 0) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Create masks for encoder-decoder attention"""
+    src_mask = create_padding_mask(src_seq, pad_idx)
+    
+    if tgt_seq is not None:
+        tgt_mask = create_padding_mask(tgt_seq, pad_idx)
+        subsequent_mask = create_subsequent_mask(tgt_seq.size(1))
+        tgt_mask = tgt_mask & subsequent_mask
+    else:
+        tgt_mask = None
+        
+    return src_mask, tgt_mask
